@@ -87,6 +87,7 @@ mod compat {
         cell::RefCell,
         ffi::{CStr, CString},
         num::NonZeroUsize,
+        os::fd::{AsRawFd, RawFd},
         path::Path,
         sync::Arc,
         thread,
@@ -94,13 +95,17 @@ mod compat {
     };
 
     use crossbeam_channel::{Receiver, Sender};
-    use rustix::fs::{cwd, openat, unlinkat, AtFlags, FileType, Mode, OFlags, RawDir};
+    use io_uring::{
+        opcode::{Nop, UnlinkAt},
+        squeue::Flags,
+        types::Fd,
+        IoUring,
+    };
+    use linux_raw_sys::general::linux_dirent64;
+    use rustix::fs::{cwd, openat, unlinkat, AtFlags, Mode, OFlags};
 
     use crate::{
-        ops::{
-            compat::DirectoryOp, concat_cstrs, join_cstr_paths, path_buf_to_cstring, IoErr,
-            LazyCell,
-        },
+        ops::{compat::DirectoryOp, concat_cstrs, path_buf_to_cstring, IoErr, LazyCell},
         Error,
     };
 
@@ -151,17 +156,26 @@ mod compat {
         thread::scope(|scope| {
             let mut threads = Vec::with_capacity(available_parallelism);
 
+            let mut io_uring = {
+                let uring = IoUring::new(256).unwrap();
+                uring
+                    .submitter()
+                    .register_iowq_max_workers(&mut [1, 1])
+                    .unwrap();
+                uring
+            };
+            let io_uring_fd = io_uring.as_raw_fd();
             for message in &tasks {
                 if available_parallelism > 0 {
                     available_parallelism -= 1;
                     threads.push(scope.spawn({
                         let tasks = tasks.clone();
-                        || worker_thread(tasks)
+                        move || worker_thread(tasks, io_uring_fd)
                     }));
                 }
 
                 match message {
-                    Message::Node(node) => delete_dir(node)?,
+                    Message::Node(node) => delete_dir(node, &mut io_uring)?,
                     Message::Error(e) => return Err(e),
                 }
             }
@@ -173,17 +187,25 @@ mod compat {
         })
     }
 
-    fn worker_thread(tasks: Receiver<Message>) -> Result<(), Error> {
+    fn worker_thread(tasks: Receiver<Message>, i: RawFd) -> Result<(), Error> {
+        let mut io_uring = {
+            let uring = IoUring::builder().setup_attach_wq(i).build(256).unwrap();
+            uring
+                .submitter()
+                .register_iowq_max_workers(&mut [1, 1])
+                .unwrap();
+            uring
+        };
         for message in tasks {
             match message {
-                Message::Node(node) => delete_dir(node)?,
+                Message::Node(node) => delete_dir(node, &mut io_uring)?,
                 Message::Error(e) => return Err(e),
             }
         }
         Ok(())
     }
 
-    fn delete_dir(node: TreeNode) -> Result<(), Error> {
+    fn delete_dir(node: TreeNode, io_uring: &mut IoUring) -> Result<(), Error> {
         thread_local! {
             static BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(8192));
         }
@@ -199,33 +221,92 @@ mod compat {
 
             let node = LazyCell::new(|| Arc::new(node));
             let mut buf = buf.borrow_mut();
-            let mut raw_dir = RawDir::new(&dir, buf.spare_capacity_mut());
-            while let Some(file) = raw_dir.next() {
-                // TODO here and other uses: https://github.com/rust-lang/rust/issues/105723
-                const DOT: &CStr = CStr::from_bytes_with_nul(b".\0").ok().unwrap();
-                const DOT_DOT: &CStr = CStr::from_bytes_with_nul(b"..\0").ok().unwrap();
+            let buf = buf.spare_capacity_mut();
 
-                let file =
-                    file.map_io_err(|| format!("Failed to read directory: {:?}", node.path))?;
-                if file.file_name() == DOT || file.file_name() == DOT_DOT {
+            let mut offset = 0;
+            let mut initialized = 0;
+            let mut pending = 0;
+            loop {
+                // if io_uring.submission().is_full() {
+                //     unsafe {
+                //         io_uring
+                //             .submission()
+                //             .push(&Nop::new().build().flags(Flags::IO_DRAIN))
+                //             .unwrap();
+                //     }
+                //     io_uring.submit_and_wait(1).unwrap();
+                //     for entry in io_uring.completion() {
+                //         assert_eq!(entry.result(), 0);
+                //     }
+                //     pending = 0;
+                // }
+
+                if offset < initialized {
+                    let dirent_ptr = buf[offset..].as_ptr();
+                    // SAFETY:
+                    // - This data is initialized by the check above.
+                    //   - Assumption: the kernel will not give us partial structs.
+                    // - Assumption: the kernel uses proper alignment between structs.
+                    // - The starting pointer is aligned (performed in RawDir::new)
+                    let dirent = unsafe { &*dirent_ptr.cast::<linux_dirent64>() };
+
+                    offset += usize::from(dirent.d_reclen);
+
+                    let file_name = unsafe { CStr::from_ptr(dirent.d_name.as_ptr().cast()) };
+
+                    // TODO here and other uses: https://github.com/rust-lang/rust/issues/105723
+                    const DOT: &CStr = CStr::from_bytes_with_nul(b".\0").ok().unwrap();
+                    const DOT_DOT: &CStr = CStr::from_bytes_with_nul(b"..\0").ok().unwrap();
+
+                    if file_name == DOT || file_name == DOT_DOT {
+                        continue;
+                    }
+
+                    if dirent.d_type == 4 {
+                        node.messages
+                            .send(Message::Node(TreeNode {
+                                path: concat_cstrs(&node.path, file_name),
+                                _parent: Some(node.clone()),
+                                messages: node.messages.clone(),
+                            }))
+                            .map_err(|_| Error::Internal)?;
+                    } else {
+                        pending += 1;
+                        unsafe {
+                            io_uring
+                                .submission()
+                                .push(
+                                    &UnlinkAt::new(Fd(dir.as_raw_fd()), file_name.as_ptr())
+                                        .build()
+                                        .flags(Flags::ASYNC),
+                                )
+                                .unwrap();
+                        }
+                    }
+
                     continue;
                 }
 
-                if file.file_type() == FileType::Directory {
-                    node.messages
-                        .send(Message::Node(TreeNode {
-                            path: concat_cstrs(&node.path, file.file_name()),
-                            _parent: Some(node.clone()),
-                            messages: node.messages.clone(),
-                        }))
-                        .map_err(|_| Error::Internal)?;
-                } else {
-                    unlinkat(&dir, file.file_name(), AtFlags::empty()).map_io_err(|| {
-                        format!(
-                            "Failed to delete file: {:?}",
-                            join_cstr_paths(&node.path, file.file_name())
-                        )
-                    })?;
+                if pending > 0 {
+                    io_uring.submit_and_wait(pending).unwrap();
+                    for entry in io_uring.completion() {
+                        assert_eq!(entry.result(), 0);
+                    }
+                    pending = 0;
+                }
+
+                offset = 0;
+
+                match unsafe {
+                    libc::syscall(
+                        libc::SYS_getdents64,
+                        dir.as_raw_fd(),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                } {
+                    bytes_read if bytes_read == 0 => break,
+                    bytes_read => initialized = bytes_read as usize,
                 }
             }
             Ok(())

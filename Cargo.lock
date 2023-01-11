@@ -488,6 +488,9 @@ version = "1.1.1"
 dependencies = [
  "crossbeam-channel",
  "ftzz",
+ "io-uring",
+ "libc",
+ "linux-raw-sys",
  "rayon",
  "remove_dir_all 0.7.0",
  "rstest",
@@ -695,6 +698,16 @@ checksum = "46112a93252b123d31a119a8d1a1ac19deac4fac6e0e8b0df58f0d4e5870e63c"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9ddf18110cedc09617f5a965bdb51adb0c0fb02c791e4ab22f7a21bb25269b0"
+dependencies = [
+ "bitflags",
+ "libc",
 ]
 
 [[package]]
